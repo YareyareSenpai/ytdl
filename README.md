@@ -2,6 +2,8 @@
 
 A `yt-dlp` wrapper with an interactive `fzf` format picker, tuned for music downloads.
 
+![ytdl showcase](ytdl-showcase.png)
+
 ## Dependencies
 
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)
@@ -13,10 +15,12 @@ A `yt-dlp` wrapper with an interactive `fzf` format picker, tuned for music down
 sudo cp ytdl /usr/local/bin/ytdl
 ```
 
-Downloads land in `~/Music/`. m4a is the default; hit Enter to grab it or scroll to pick any format in the list.
-
 ## Usage
 
-ytdl <URL> # Single track — fzf picks format
-ytdl <URL> -p # Full playlist
+```
+ytdl <URL>              # Single track — fzf picks format
+ytdl <URL> -p           # Full playlist
 ytdl --help
+```
+
+Downloads land in `~/Music/`. m4a is the default; hit Enter to grab it or scroll to pick any format in the list.
