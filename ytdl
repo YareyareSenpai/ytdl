@@ -15,7 +15,8 @@ Usage:
 Format selection:
   [DEFAULT] m4a is pre-selected — just hit Enter to grab best native m4a
   Scroll the list to pick any other format (opus, webm, etc.)
-  In playlist mode, if a track lacks your chosen format it falls back to best m4a
+  In playlist mode, formats are read from the first track only, and if a
+  track lacks your chosen format it falls back to best m4a
 
 Output:
   Single:   ~/Music/<uploader> - <title>.m4a
@@ -23,24 +24,116 @@ Output:
 HELP
 }
 
-if [[ $# -lt 1 ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
-    usage
-    exit 0
-fi
+# ---------- argument parsing ----------
 
-URL="$1"
-MUSIC_DIR=~/Music
+URL=""
 PLAYLIST_MODE=false
 
 for arg in "$@"; do
     case $arg in
+        -h|--help) usage; exit 0 ;;
         -p|--playlist) PLAYLIST_MODE=true ;;
+        -*) echo "Unknown option: $arg" >&2; usage >&2; exit 1 ;;
+        *) [[ -z "$URL" ]] && URL="$arg" ;;
     esac
 done
 
-echo "Fetching available formats..."
+if [[ -z "$URL" ]]; then
+    usage
+    exit 0
+fi
 
-FORMAT_LIST=$(yt-dlp -F "$URL" 2>/dev/null | grep -E '^[0-9]+')
+MUSIC_DIR=~/Music
+
+# ---------- dependency check ----------
+
+for dep in yt-dlp fzf; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+        echo "Error: '$dep' is not installed or not in PATH." >&2
+        exit 1
+    fi
+done
+
+# ---------- cleanup ----------
+
+TMP_OUT=""
+TMP_ERR=""
+BG_PID=""
+
+cleanup() {
+    [[ -n "$BG_PID" ]] && kill "$BG_PID" 2>/dev/null || true
+    [[ -n "$TMP_OUT" ]] && rm -f "$TMP_OUT"
+    [[ -n "$TMP_ERR" ]] && rm -f "$TMP_ERR"
+    if [[ -t 2 ]]; then
+        printf '\033[?25h' >&2   # restore cursor
+    fi
+}
+trap cleanup EXIT
+trap 'echo >&2; echo "Interrupted." >&2; exit 130' INT TERM
+
+# ---------- fetch formats (with spinner) ----------
+
+if $PLAYLIST_MODE; then
+    FETCH_LABEL="Fetching available formats (from first track of playlist)"
+else
+    FETCH_LABEL="Fetching available formats"
+fi
+
+if [[ "$URL" == *list=* && "$URL" != *v=* ]] && ! $PLAYLIST_MODE; then
+    echo "Note: this looks like a playlist URL but -p was not given — only the first track will be downloaded." >&2
+fi
+
+TMP_OUT=$(mktemp)
+TMP_ERR=$(mktemp)
+
+yt-dlp -F --no-warnings --playlist-items 1 --socket-timeout 20 "$URL" \
+    >"$TMP_OUT" 2>"$TMP_ERR" &
+BG_PID=$!
+
+FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+START=$SECONDS
+i=0
+
+if [[ -t 2 ]]; then
+    printf '\033[?25l' >&2   # hide cursor
+    while kill -0 "$BG_PID" 2>/dev/null; do
+        printf '\r\033[K%s %s... %ds' "${FRAMES[i % ${#FRAMES[@]}]}" "$FETCH_LABEL" "$((SECONDS - START))" >&2
+        i=$((i + 1))
+        sleep 0.1
+    done
+    printf '\r\033[K' >&2
+    printf '\033[?25h' >&2   # show cursor
+else
+    echo "$FETCH_LABEL..." >&2
+fi
+
+FETCH_RC=0
+wait "$BG_PID" || FETCH_RC=$?
+BG_PID=""
+
+if [[ $FETCH_RC -ne 0 ]]; then
+    echo "Error: yt-dlp failed to fetch formats (exit code $FETCH_RC)." >&2
+    if [[ -s "$TMP_ERR" ]]; then
+        echo "--- yt-dlp output ---" >&2
+        tail -n 10 "$TMP_ERR" >&2
+    fi
+    exit 1
+fi
+
+FORMAT_LIST=$(grep -E '^[0-9]+' "$TMP_OUT" || true)
+
+if [[ -z "$FORMAT_LIST" ]]; then
+    echo "Error: no downloadable formats were found for this URL." >&2
+    if [[ -s "$TMP_ERR" ]]; then
+        echo "--- yt-dlp output ---" >&2
+        tail -n 10 "$TMP_ERR" >&2
+    fi
+    exit 1
+fi
+
+echo "Found $(printf '%s\n' "$FORMAT_LIST" | wc -l) formats (took $((SECONDS - START))s)." >&2
+
+# ---------- format picker ----------
 
 M4A_DEFAULT="[DEFAULT] m4a  │  ba[ext=m4a]/ba[acodec^=mp4a]/ba  │  best available m4a, no transcode"
 
@@ -51,12 +144,14 @@ CHOSEN=$(printf '%s\n%s' "$M4A_DEFAULT" "$FORMAT_LIST" \
         --layout=reverse \
         --border=rounded \
         --height=60% \
-        --highlight-line)
+        --highlight-line) || true
 
 if [[ -z "$CHOSEN" ]]; then
     echo "Cancelled."
     exit 0
 fi
+
+# ---------- build download command ----------
 
 if $PLAYLIST_MODE; then
     OUTPUT="$MUSIC_DIR/%(playlist_title)s/%(playlist_index)s - %(uploader)s - %(title)s.%(ext)s"
@@ -65,21 +160,39 @@ else
 fi
 
 if [[ "$CHOSEN" == "$M4A_DEFAULT" ]]; then
-    FORMAT='-f ba[ext=m4a]/ba[acodec^=mp4a]/ba'
+    FORMAT_SPEC='ba[ext=m4a]/ba[acodec^=mp4a]/ba'
 else
     FORMAT_CODE=$(echo "$CHOSEN" | awk '{print $1}')
-    FORMAT="-f $FORMAT_CODE/ba[ext=m4a]/ba[acodec^=mp4a]/ba"
+    FORMAT_SPEC="$FORMAT_CODE/ba[ext=m4a]/ba[acodec^=mp4a]/ba"
 fi
 
-echo "Downloading${PLAYLIST_MODE:+ playlist}..."
+YTDLP_ARGS=(
+    -f "$FORMAT_SPEC"
+    --remux-video m4a
+    --embed-metadata
+    --embed-thumbnail
+    --ignore-errors
+    --socket-timeout 20
+    -o "$OUTPUT"
+)
 
-yt-dlp \
-    $FORMAT \
-    --remux-video m4a \
-    --embed-metadata \
-    --embed-thumbnail \
-    --ignore-errors \
-    -o "$OUTPUT" \
-    ${PLAYLIST_MODE:+--yes-playlist} \
-    ${PLAYLIST_MODE:+--sleep-interval 1} \
-    "$URL"
+if $PLAYLIST_MODE; then
+    YTDLP_ARGS+=(--yes-playlist --sleep-interval 1)
+    echo "Downloading playlist..."
+else
+    YTDLP_ARGS+=(--no-playlist --playlist-items 1)
+    echo "Downloading..."
+fi
+
+# ---------- download ----------
+
+DL_RC=0
+yt-dlp "${YTDLP_ARGS[@]}" "$URL" || DL_RC=$?
+
+echo
+if [[ $DL_RC -eq 0 ]]; then
+    echo "Done. Saved to $MUSIC_DIR"
+else
+    echo "Finished with errors (yt-dlp exit code $DL_RC) — some tracks may have been skipped. Scroll up for details." >&2
+    exit "$DL_RC"
+fi
